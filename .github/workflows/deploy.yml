@@ -33,4 +33,4 @@ jobs:
         key: ${{ secrets.SSHKEY }}
         script: |
           cd projects/tgtg-telegram-bot
-          docker compose up --build -d
+          sudo docker compose up --build -d
