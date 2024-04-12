@@ -1,0 +1,9 @@
+# Config token
+config.ini
+
+# Bot data
+data/
+
+# Python-related
+__pycache__/
+.idea/*

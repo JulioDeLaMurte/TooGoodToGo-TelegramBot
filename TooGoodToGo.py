@@ -1,0 +1,411 @@
+import json
+import time
+
+from pathlib import Path
+from _thread import start_new_thread
+from datetime import datetime
+from pytz import timezone, utc
+
+import tgtg
+
+from tgtg import TgtgClient
+from telebot import TeleBot, types
+
+class TooGoodToGo:
+
+    ITEM_STATUS = {
+        'sold_out': 'Stock épuisé',
+        'new_stock': 'Nouveau stock',
+        'stock_reduced': 'Stock réduit',
+        'stock_increased': 'Stock augmenté',
+    }
+
+    users_login_data = {}
+    users_settings_data = {}
+    available_items_favorites = {}
+    connected_clients = {}
+
+    def __init__(self, bot_token: str, config: dict = {}):
+        self.bot = TeleBot(bot_token)
+
+        self.__set_config(config)
+
+        self.read_users_login_data_from_txt()
+        self.read_users_settings_data_from_txt()
+        self.read_available_items_favorites_from_txt()
+
+        start_new_thread(self.get_available_items_per_user, ())
+
+        self.bot.set_my_commands([
+            types.BotCommand("/info", "Vos établissements favoris disponibles"),
+            types.BotCommand("/login", "Connection avec votre email TooGoodToGo"),
+            types.BotCommand("/settings", "Parametrage des notifications"),
+            types.BotCommand("/help", "Aide et explication des commandes"),
+        ])
+    
+    def __set_config(self, config: dict):
+        self.timezone = timezone(config.get('timezone', 'UTC'))
+        print('timezone', self.timezone)
+
+        self.language = config.get('language', 'fr-FR')
+        print('language', self.language)
+
+        # min 2 default 5
+        self.login_timeout_minutes = max(2, int(config.get('login_timeout_minutes', 5)))
+        print('login_timeout_minutes', self.login_timeout_minutes)
+
+        tgtg.MAX_POLLING_TRIES = (self.login_timeout_minutes * 60) // tgtg.POLLING_WAIT_TIME
+
+        # min 5 default 60
+        self.interval_seconds = max(5, int(config.get('interval_seconds', 60)))
+        print('interval_seconds', self.interval_seconds)
+
+        # min self.interval_seconds default 1800
+        self.low_hours_interval_seconds = max(self.interval_seconds, int(config.get('low_hours_interval_seconds', 1800)))
+        print('low_hours_interval_seconds', self.low_hours_interval_seconds)
+
+        # min 0 max 23 default 23
+        self.low_hours_start = max(0, min(23, int(config.get('low_hours_start', 23))))
+        
+        # min 0 max 23 default 6
+        self.low_hours_end = max(0, min(23, int(config.get('low_hours_end', 6))))
+        print('Low hours', self.low_hours_start, '-', self.low_hours_end)
+
+    def send_message(self, telegram_user_id, message, parse_mode=None):
+        self.bot.send_message(telegram_user_id, text=message, parse_mode=parse_mode)
+
+    def send_message_with_link(self, telegram_user_id, message, item_id):
+        self.bot.send_message(telegram_user_id, text=message, reply_markup=types.InlineKeyboardMarkup(
+            keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="Ouvert dans l'application 📱",
+                        callback_data="open_app",
+                        url="https://share.toogoodtogo.com/item/" + item_id
+                    )
+                ],
+            ])
+        )
+
+    def read_users_login_data_from_txt(self):
+        with open(data_file('users_login_data'), 'r') as file:
+            self.users_login_data = json.load(file, cls=DateTimeDecoder)
+
+    def save_users_login_data_to_txt(self):
+        with open(data_file('users_login_data'), 'w') as file:
+            json.dump(self.users_login_data, file, cls=DateTimeEncoder)
+
+    def read_users_settings_data_from_txt(self):
+        with open(data_file('users_settings_data'), 'r') as file:
+            self.users_settings_data = json.load(file)
+
+    def save_users_settings_data_to_txt(self):
+        with open(data_file('users_settings_data'), 'w') as file:
+            json.dump(self.users_settings_data, file)
+
+    def read_available_items_favorites_from_txt(self):
+        with open(data_file('available_items_favorites'), 'r') as file:
+            self.available_items_favorites = json.load(file)
+
+    def save_available_items_favorites_to_txt(self):
+        with open(data_file('available_items_favorites'), 'w') as file:
+            json.dump(self.available_items_favorites, file)
+
+    def add_user(self, login_client, telegram_user_id, telegram_username, credentials):
+        credentials['email'] = login_client.email
+        credentials['telegram_username'] = telegram_username
+        credentials['last_time_token_refreshed'] = login_client.last_time_token_refreshed
+
+        self.users_login_data[telegram_user_id] = credentials
+        self.save_users_login_data_to_txt()
+
+        if telegram_user_id not in self.users_settings_data:
+            self.users_settings_data[telegram_user_id] = {
+                'sold_out': 0,
+                'new_stock': 1,
+                'stock_reduced': 0,
+                'stock_increased': 0
+            }
+            self.save_users_settings_data_to_txt()
+
+    # Get the credentials
+    def new_user(self, telegram_user_id, telegram_username, email):
+        client = TgtgClient(email=email, language=self.language)
+
+        self.send_message(telegram_user_id, "📩 Veuillez ouvrir votre boite mail."
+                                    "\nVous allez recevoir un email de TooGoodToGo avec un lien de confirmation."
+                                    "\n_Ouvrir l'application sur mobile ne fonctionnera pas si vous avez installé l'application TooGoodToGo_\n"
+                                    "\n*Vous devez ouvrir le lien dans le navigateur de votre PC.*"
+                                    "\n_Il n'est pas la peine de rentrer de mot de passe._", parse_mode="markdown")
+
+        try:
+            credentials = client.get_credentials() # login
+            self.add_user(client, telegram_user_id, telegram_username, credentials)
+            self.connect(telegram_user_id)
+            self.send_message(telegram_user_id, "✅ Vous êtes maintenant connecté !")
+        except tgtg.exceptions.TgtgPollingError as err:
+            if 'Max retries' in str(err):
+                self.send_message(telegram_user_id, "⏱ *temps expiré. Veuillez vous reconnecter.*", parse_mode="markdown")
+            else:
+                raise err
+        except tgtg.exceptions.TgtgAPIError as err:
+            self.handle_api_error(err, telegram_user_id, client)
+            self.send_message(telegram_user_id, "❌ Erreur de connection. Veuillez réessayer plus tard.")
+        except Exception as err:
+            print(f"Unexpected {err=}, {type(err)=}")
+            self.send_message(telegram_user_id, "❌ Une erreur est survenue lors de la connection. Veuillez réessayer plus tard.")
+    
+    # Save refreshed tokens and cookies
+    def update_credentials(self, telegram_user_id, refresh=False, client=None):
+        if not client:
+            client = self.get_client(telegram_user_id)
+
+            if not client:
+                return False
+
+        if refresh:
+            client.login() # tokens may need to be refreshed
+        
+        user_credentials = self.find_credentials_by_telegramUserID(telegram_user_id)
+
+        if user_credentials and user_credentials['last_time_token_refreshed'] < client.last_time_token_refreshed:
+            user_credentials['last_time_token_refreshed'] = client.last_time_token_refreshed
+            user_credentials['access_token'] = client.access_token
+            user_credentials['refresh_token'] = client.refresh_token
+            user_credentials['cookie'] = client.cookie
+
+            self.save_users_login_data_to_txt()
+
+            print(f"{telegram_user_id} token refreshed")
+        
+        return True
+
+    # Look if the user is already logged in
+    def find_credentials_by_telegramUserID(self, user_id):
+        return self.users_login_data.get(user_id)
+
+    # Checks if a connection already exists, or if it has to be created initially.
+    def connect(self, user_id):
+        client = self.get_client(user_id)
+
+        if not client:
+            user_credentials = self.find_credentials_by_telegramUserID(user_id)
+
+            if not user_credentials:
+                return None
+            
+            print(f"Connect {user_id}")
+            client = TgtgClient(user_id=user_credentials["user_id"],
+                                access_token=user_credentials["access_token"],
+                                refresh_token=user_credentials["refresh_token"],
+                                last_time_token_refreshed=user_credentials["last_time_token_refreshed"],
+                                cookie=user_credentials["cookie"],
+                                language=self.language)
+            self.connected_clients[user_id] = client
+            time.sleep(2)
+
+        return client
+    
+    def get_client(self, user_id):
+        return self.connected_clients.get(user_id)
+
+    def get_favourite_items(self, telegram_user_id):
+        client = self.connect(telegram_user_id)
+
+        if not client:
+            return None
+
+        favourite_items = client.get_items(favorites_only=True)
+
+        self.update_credentials(telegram_user_id, client=client)
+
+        return favourite_items
+
+    # /info command
+    def send_available_favourite_items_for_one_user(self, user_id):
+        try:
+            available_items = []
+            favourite_items = self.get_favourite_items(user_id)
+            for item in favourite_items:
+                if item['items_available'] > 0:
+                    item_id = item['item']['item_id']
+                    item_text = self.format_item(item)
+                    self.send_message_with_link(user_id, item_text, item_id)
+                    available_items.append(item_id)
+            if not favourite_items:
+                self.send_message(user_id, "Vous n'avez pas encore ajouté d'établissements favoris.")
+            elif not available_items:
+                self.send_message(user_id, "Tous vos favoris sont actuellement en rupture de stock 😕")
+        except tgtg.exceptions.TgtgAPIError as err:
+            self.send_message(user_id, "❌ Impossible de récupérer votre liste de favoris... Veuillez réessayer plus tard.")
+            self.handle_api_error(err, user_id)
+        except Exception as err:
+            print(f"Unexpected {err=}, {type(err)=}")
+            self.send_message(user_id, "❌ Une erreur est survenue lors de la récuperation de votre liste de favories. Veuillez réessayer plus tard.")
+    
+    def handle_api_error(self, err, user_id, client=None):
+        if len(err.args) == 2:
+            status, message = err.args
+
+            if status in [401, 403]:
+                print(f"API Unauthorized [{status}]: {message}")
+                
+                if not client:
+                    client = self.get_client(user_id)
+                
+                print('Headers', client._headers if client else None)
+
+                if status == 401:
+                    user_credentials = self.find_credentials_by_telegramUserID(user_id)
+
+                    if user_credentials:
+                        del self.connected_clients[user_id]
+                        del self.users_login_data[user_id]
+                        self.save_users_login_data_to_txt()
+                        print("Expired user login data:", user_id)
+                        
+                        self.send_message(user_id, f"Bonjour, {user_credentials['telegram_username']}, votre session a expiré, veuillez vous /login à nouveau pour continuer de recevoir vos notifications.")
+            else:
+                print(f"API Error [{status}]: {message}")
+        else:
+            print(f"Unexpected API Error: {err=}")
+    
+    def format_item(self, item, status = None, user_id = None) -> str:
+        store_name = item['store']['store_name'].strip()
+        store_name_text = f"🍽 {store_name}"
+        store_address_line = f"🧭 {item['store']['store_location']['address']['address_line']}"
+        store_items_available = item['items_available']
+        store_items_available_text = f"🥡 {item['items_available']}"
+        item_price_code = self.__format_price_code(item['item']['item_price']['code'])
+        item_price = f"💰 {int(item['item']['price_including_taxes']['minor_units']) / 100} {item_price_code}"
+
+        item_text = f"{store_name_text}\n{store_address_line}\n{item_price}\n{store_items_available_text}"
+
+        if store_items_available > 0:
+            store_pickup_start = self.__format_datetime(item['pickup_interval']['start'])
+            store_pickup_end = self.__format_datetime(item['pickup_interval']['end'])
+            store_pickup_text = f"⏰ {store_pickup_start} - {store_pickup_end}"
+            item_text += '\n' + store_pickup_text
+        
+        if status:
+            status = self.format_status(status)
+            item_text += '\n' + status
+            if user_id:
+                item_id = item['item']['item_id']
+                print(f"[{user_id}] {status} {store_items_available_text} 🍽  {store_name} ({item_id})")
+        
+        return item_text
+    
+    def __format_price_code(self, price_code: str) -> str:
+        if price_code == 'EUR':
+            return '€'
+        if price_code == 'USD':
+            return '$'
+        return price_code
+
+    def format_status(self, status: str) -> str:
+        return TooGoodToGo.ITEM_STATUS[status]
+
+    def get_available_items_per_user(self):
+        """Loop through all users and see if the number of their favorite bags has changed"""
+        while True:
+            changed_items_status = {}
+            available_items_before = len(self.available_items_favorites)
+            
+            for user_id in self.users_login_data:
+                try:
+                    user_settings = self.users_settings_data[user_id]
+
+                    # if any alert is enabled for this user
+                    if any(setting == 1 for setting in user_settings.values()):
+                        favourite_items = self.get_favourite_items(user_id)
+
+                        for item in favourite_items:
+                            item_id = item['item']['item_id']
+                            status = changed_items_status.get(item_id)
+
+                            if status is None and item_id in self.available_items_favorites:
+                                old_items_available = int(self.available_items_favorites[item_id]['items_available'])
+                                new_items_available = int(item['items_available'])
+                                if new_items_available == 0 and old_items_available > 0:  # Sold out (x -> 0)
+                                    status = 'sold_out'
+                                elif old_items_available == 0 and new_items_available > 0:  # New Bag available (0 -> x)
+                                    status = 'new_stock'
+                                elif new_items_available < old_items_available:  # Reduced stock available (x -> x-1)
+                                    status = 'stock_reduced'
+                                elif new_items_available > old_items_available:  # Increased stock available (x -> x+1)
+                                    status = 'stock_increased'
+
+                            if status:
+                                changed_items_status[item_id] = status
+
+                                if user_settings[status]:
+                                    item_text = self.format_item(item, status, user_id)
+                                    self.send_message_with_link(user_id, item_text, item_id)
+                            
+                            self.available_items_favorites[item_id] = item
+                except tgtg.exceptions.TgtgAPIError as err:
+                    self.handle_api_error(err, user_id)
+            
+            try:
+                if changed_items_status or len(self.available_items_favorites) != available_items_before:
+                    self.save_available_items_favorites_to_txt()
+            except Exception as err:
+                print(f"Unexpected {err=}, {type(err)=}")
+            
+            # wait until next check
+            time.sleep(self.get_interval_seconds())
+    
+    def get_interval_seconds(self):
+        low_hours = False
+        now = datetime.now(self.timezone)
+        current_hour = now.hour
+        # e.g. 0 - 6
+        if self.low_hours_start <= self.low_hours_end:
+            low_hours = self.low_hours_start <= current_hour < self.low_hours_end
+        # e.g. 23 - 6
+        elif current_hour >= self.low_hours_start or current_hour < self.low_hours_end:
+            low_hours = True
+        if low_hours:
+            next_hour = (current_hour + 1) % 24
+            if next_hour >= self.low_hours_end:
+                # adjust interval to the minimum required when low hours are ending
+                remaining_minutes = 59 - now.minute
+                remaining_seconds = 60 - now.second
+                time_to_end_low_hours = remaining_minutes * 60 + remaining_seconds
+                if time_to_end_low_hours < self.low_hours_interval_seconds:
+                    return max(time_to_end_low_hours, self.interval_seconds)
+            return self.low_hours_interval_seconds
+        return self.interval_seconds
+    
+    def __format_datetime(self, datetime_str: str) -> str:
+        return datetime.strptime(datetime_str, '%Y-%m-%dT%H:%M:%SZ') \
+                    .astimezone(self.timezone) \
+                    .strftime("%a %d.%m à %H:%M")
+
+def data_file(data_file_name: str, data_folder='data', extension='json') -> Path:
+    data_path = Path(f'{data_folder}/{data_file_name}.{extension}')
+    if not data_path.exists():
+        data_path.parent.mkdir(exist_ok=True, parents=True)
+        data_path.write_text('{}')
+        print(f'Created {data_path}')
+    return data_path
+
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.astimezone(utc).isoformat()
+        return super().default(obj)
+
+class DateTimeDecoder(json.JSONDecoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, object_hook=self.object_hook, **kwargs)
+
+    def object_hook(self, obj):
+        for key, value in obj.items():
+            if key == 'last_time_token_refreshed':
+                obj[key] = datetime.fromisoformat(value) \
+                    .astimezone().replace(tzinfo=None)
+                    # tgtg model login uses local timezone naive datetime.now() to compare refresh token time
+                    # tgtg/__init__.py", line 121, in _refresh_token
+        return obj
