@@ -22,7 +22,7 @@ jobs:
         port: ${{ secrets.PORT }}
         key: ${{ secrets.SSHKEY }}
         source: "."
-        target: "./projects/"
+        target: "./projects/tgtg-telegram-bot"
 
     - name: Executing remote command
       uses: appleboy/ssh-action@master
